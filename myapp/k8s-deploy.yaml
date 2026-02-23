@@ -1,0 +1,75 @@
+# Namespace, ServiceAccount, Secret은 Service Connector가 자동 생성
+# - Namespace: myapp (kubectl create namespace myapp)
+# - SA: sc-account-0429ea37-bae6-45c3-beeb-e5efdcaa67ba (myapp_aif_connection)
+# - Secret: sc-myappaifconnection-secret (myapp_aif_connection)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agui-server
+  namespace: myapp
+  labels:
+    app: agui-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agui-server
+  template:
+    metadata:
+      labels:
+        app: agui-server
+        azure.workload.identity/use: "true"
+      annotations:
+        instrumentation.opentelemetry.io/inject-python: "true"
+    spec:
+      serviceAccountName: sc-account-0429ea37-bae6-45c3-beeb-e5efdcaa67ba
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "general"
+          effect: "NoSchedule"
+      containers:
+        - name: agui-server
+          image: acrcontosokrc01.azurecr.io/myapp/agui-server:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: sc-myappaifconnection-secret
+          env:
+            - name: AZURE_OPENAI_DEPLOYMENT_NAME
+              value: "gpt-5.2-chat"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /chat/
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /chat/
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agui-server
+  namespace: myapp
+spec:
+  selector:
+    app: agui-server
+  ports:
+    - port: 80
+      targetPort: 8080
+  type: ClusterIP

@@ -1,0 +1,7 @@
+agent-framework-ag-ui
+azure-identity
+fastapi
+uvicorn[standard]
+opentelemetry-api
+opentelemetry-semantic-conventions-ai==0.4.13
+opentelemetry-instrumentation-openai-v2

@@ -1,0 +1,60 @@
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: otel-collector
+  namespace: opentelemetry-operator-system
+spec:
+  image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.146.0
+  mode: deployment
+  replicas: 1
+  tolerations:
+    - key: "workload"
+      operator: "Equal"
+      value: "general"
+      effect: "NoSchedule"
+  config:
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+    processors:
+      batch:
+        send_batch_size: 1024
+        timeout: 5s
+    exporters:
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        resource_to_telemetry_conversion:
+          enabled: true
+    service:
+      pipelines:
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [prometheus]
+---
+apiVersion: azmonitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: otel-collector-metrics
+  namespace: opentelemetry-operator-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: opentelemetry-collector
+      app.kubernetes.io/instance: opentelemetry-operator-system.otel-collector
+      app.kubernetes.io/managed-by: opentelemetry-operator
+  podMetricsEndpoints:
+    - port: prometheus
+      path: /metrics
+      interval: 30s
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      metricRelabelings:
+        - targetLabel: source
+          replacement: otel-collector
+          action: replace
