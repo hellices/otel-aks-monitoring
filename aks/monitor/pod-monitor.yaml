@@ -1,0 +1,13 @@
+apiVersion: azmonitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: helixa-rubicon
+  namespace: helixa
+spec:
+  selector:
+    matchLabels:
+      app: helixa-rubicon
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
