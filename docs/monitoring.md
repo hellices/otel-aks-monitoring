@@ -339,6 +339,67 @@ az rest --method put \
 **원인:** `opentelemetry-instrumentation-openai-v2`가 의존성으로 `0.4.14`를 설치, `agent-framework`가 `SpanAttributes.LLM_SYSTEM` 사용 → 0.4.14에서 제거됨  
 **해결:** `requirements.txt`에 `opentelemetry-semantic-conventions-ai==0.4.13` 고정
 
+### 6.5 PodMonitor 적용 시 Azure RBAC 에러
+
+```
+❌ 증상: kubectl apply -f aks/monitor/pod-monitor.yaml 실행 시 Forbidden 에러
+   podmonitors.azmonitoring.coreos.com "<name>" is forbidden:
+   User "<user>" cannot get resource "podmonitors" in API group "azmonitoring.coreos.com"
+   in the namespace "<namespace>": User does not have access to the resource in Azure.
+   Update role assignment to allow access.
+```
+
+**원인:** AKS에 Azure AD + Azure RBAC 통합이 활성화되어 있으면 Kubernetes 리소스 접근이 Azure RBAC 롤 할당으로 제어됨. `azmonitoring.coreos.com` CRD(PodMonitor, ServiceMonitor)를 생성/수정하려면 네임스페이스 또는 클러스터 수준의 Azure Kubernetes Service RBAC 롤이 필요.
+
+**해결 방법 1 — Azure Portal:**
+
+1. [Azure Portal](https://portal.azure.com) → AKS 클러스터 리소스 선택
+2. 왼쪽 메뉴 **액세스 제어(IAM)** 클릭
+3. **+ 추가** → **역할 할당 추가** 클릭
+4. **역할** 탭에서 `Azure Kubernetes Service RBAC Admin` 검색 후 선택  
+   (클러스터 전체 관리자 권한이 필요하면 `Azure Kubernetes Service RBAC Cluster Admin` 선택)
+5. **구성원** 탭 → **구성원 선택** → 권한을 부여할 사용자 이메일 입력 후 선택
+6. **조건** 탭 → 특정 네임스페이스로 범위를 제한하려면 조건 추가 가능 (선택 사항)
+7. **검토 + 할당** 클릭
+
+**해결 방법 2 — az 명령:**
+
+```bash
+# 변수 설정
+SUBSCRIPTION_ID="<구독 ID>"
+RESOURCE_GROUP="<리소스 그룹>"
+CLUSTER_NAME="<AKS 클러스터 이름>"
+NAMESPACE="<네임스페이스>"        # 네임스페이스 범위로 제한할 경우
+ASSIGNEE="<사용자 이메일 또는 Object ID>"
+
+# 방법 A: 클러스터 전체 범위로 Azure Kubernetes Service RBAC Admin 할당
+az role assignment create \
+  --assignee "${ASSIGNEE}" \
+  --role "Azure Kubernetes Service RBAC Admin" \
+  --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${CLUSTER_NAME}"
+
+# 방법 B: 특정 네임스페이스 범위로 제한 (최소 권한 원칙)
+az role assignment create \
+  --assignee "${ASSIGNEE}" \
+  --role "Azure Kubernetes Service RBAC Admin" \
+  --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${CLUSTER_NAME}/namespaces/${NAMESPACE}"
+
+# 할당 확인
+az role assignment list \
+  --assignee "${ASSIGNEE}" \
+  --scope "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ContainerService/managedClusters/${CLUSTER_NAME}" \
+  --output table
+```
+
+> **참고:** 역할 할당 후 `az aks get-credentials`로 kubeconfig를 다시 받으면 새 권한이 즉시 반영됨.
+
+```bash
+az aks get-credentials \
+  --resource-group "${RESOURCE_GROUP}" \
+  --name "${CLUSTER_NAME}" \
+  --overwrite-existing
+```
+
 ---
 
 ## 7. 진단 명령어

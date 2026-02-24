@@ -33,6 +33,10 @@ workspace/
 │   ├── architecture.md                    # 아키텍처 개요 (플랫폼, 네트워크, 보안)
 │   └── monitoring.md                      # 모니터링 구축 가이드 (OTel, AMPLS, 디버깅)
 │
+├── aks/
+│   └── monitor/
+│       └── pod-monitor.yaml               # 앱 네임스페이스용 PodMonitor (azmonitoring.coreos.com)
+│
 ├── infra/
 │   ├── opentelemetry-operator.yaml        # OTel Operator 전체 매니페스트 (CRD, RBAC, Webhook)
 │   └── otel-collector.yaml                # OTel Collector CR + PodMonitor
@@ -69,6 +73,9 @@ workspace/
 # 인프라 (최초 1회)
 kubectl apply -f infra/opentelemetry-operator.yaml
 kubectl apply -f infra/otel-collector.yaml
+
+# 앱 네임스페이스 PodMonitor (Azure RBAC 권한 필요 — docs/monitoring.md 6.5 참고)
+kubectl apply -f aks/monitor/pod-monitor.yaml
 
 # 앱
 kubectl apply -f myapp/otel-instrumentation.yaml
