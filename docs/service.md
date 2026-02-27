@@ -1,12 +1,17 @@
 # 서비스 아키텍처
 
-> AG-UI 채팅 서비스의 애플리케이션 구조, API 명세, 인증 흐름, 배포 구성, 운영 관점 가이드.
+> 클러스터 내 두 개 앱 서비스의 애플리케이션 구조, API 명세, 인증 흐름, 배포 구성, 운영 관점 가이드.
 >
-> 인프라(네트워크, Private Endpoint, Firewall 등)는 [architecture.md](architecture.md), 모니터링 파이프라인은 [monitoring.md](monitoring.md) 참조.
+> - **myapp** (ns: `myapp`): AG-UI 채팅 서비스, OTel Operator auto-inject, Prometheus/Grafana 모니터링
+> - **otel-app** (ns: `otel-app`): question-app ([hellices/otel-langfuse](https://github.com/hellices/otel-langfuse)), 앱 내장 OTel SDK, Application Insights 모니터링
+>
+> 인프라(네트워크, Private Endpoint, Firewall 등)는 [architecture.md](architecture.md), 모니터링은 [monitoring.md](monitoring.md) (개요) / [monitoring-prometheus.md](monitoring-prometheus.md) (myapp) / [monitoring-appinsights.md](monitoring-appinsights.md) (otel-app) 참조.
 
 ---
 
 ## 1. 서비스 토폴로지
+
+### 1.1 myapp: AG-UI 채팅 서비스
 
 ```
 ┌─ 클라이언트 ─────────────────────────────────────────────────────────┐
@@ -44,20 +49,55 @@
    └──────────────┘  └──────────────┘  └──────────────────┘
 ```
 
-### 의존 서비스 요약
+### 1.2 otel-app: question-app
+
+> 소스: [`hellices/otel-langfuse`](https://github.com/hellices/otel-langfuse) — LangGraph 기반 Teacher-Student 퀴즈 시스템. 앱 내장 OTel SDK로 트레이스/메트릭 전송.
+
+```
+┌─ 클라이언트 ──────────────────────────────────────────────────────────┐
+│  POST /ask  →  LLM 응답 + OTel trace/metric 전송                       │
+└───────────────────────────────────────────────────────────────┘
+                             │
+                  ┌────────▼────────┐
+                  │  K8s Service        │
+                  │  question-app       │
+                  │  ClusterIP :80       │
+                  └──────────┬─────────┘
+                             │ :8000
+                  ┌──────────▼─────────┐
+                  │  Deployment          │
+                  │  question-app        │
+                  │  (OTel SDK 내장)      │
+                  └──────────┬─────────┘
+                             │
+            ┌───────────────┼───────────────┐
+            ▼                ▼                ▼
+ ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐
+ │ AI Foundry    │  │ OTel Collector│  │ Azure AD          │
+ │ OpenAI API    │  │ (otel-app ns) │  │ Workload Identity │
+ │ gpt-5.2-chat  │  │ gRPC :4317    │  │                  │
+ └──────────────┘  └──────┬───────┘  └──────────────────┘
+                       │
+              ┌───────┴───────────────┐
+              ▼                        ▼
+   Application Insights       Managed Prometheus
+   (traces + metrics)         (PodMonitor 경유)
+```
+
+### 1.3 의존 서비스 요약
 
 | 의존 서비스 | 프로토콜 | 용도 | 장애 시 영향 |
 |---|---|---|---|
 | AI Foundry (OpenAI) | HTTPS (PE) | LLM 추론 | 채팅 응답 불가 |
 | Azure AD (OIDC) | HTTPS | Workload Identity 토큰 | 인증 실패, API 호출 불가 |
-| OTel Collector | OTLP HTTP | 메트릭 전송 | 메트릭 유실 (앱 동작에는 무영향) |
+| OTel Collector | OTLP HTTP/gRPC | 메트릭/트레이스 전송 | 메트릭 유실 (앱 동작에는 무영향) |
 | ACR | HTTPS (PE) | 이미지 Pull | 신규 배포/스케일링 불가 |
 
 ---
 
 ## 2. API 명세
 
-### 2.1 엔드포인트
+### 2.1 myapp 엔드포인트
 
 | Method | Path | Content-Type | 설명 |
 |---|---|---|---|
@@ -68,7 +108,16 @@
 | GET | `/docs` | `text/html` | Swagger UI (FastAPI 자동 생성) |
 | GET | `/openapi.json` | `application/json` | OpenAPI 스펙 |
 
-### 2.2 AG-UI 프로토콜 (`/api/agent`)
+### 2.2 question-app 엔드포인트 (otel-app)
+
+> 앱 API 상세는 [upstream README](https://github.com/hellices/otel-langfuse) 참조.
+
+| Method | Path | 설명 |
+|---|---|---|
+| POST | `/ask` | Teacher-Student 퀴즈 실행 (LangGraph 멀티에이전트) |
+| GET | `/health` | 헬스체크 (Readiness/Liveness 프로브 대상) |
+
+### 2.3 AG-UI 프로토콜 (`/api/agent`)
 
 **Request:**
 ```json
@@ -97,7 +146,7 @@ data: {"type":"RUN_FINISHED","threadId":"...","runId":"..."}
 | `TEXT_MESSAGE_END` | 메시지 완료 |
 | `RUN_FINISHED` | 에이전트 실행 완료 |
 
-### 2.3 에러 응답
+### 2.4 에러 응답
 
 | 상황 | HTTP Status | 원인 |
 |---|---|---|
@@ -165,7 +214,9 @@ Secret `sc-myappaifconnection-secret`에서 `envFrom`으로 주입:
 |---|---|---|
 | `AZURE_OPENAI_DEPLOYMENT_NAME` | `gpt-5.2-chat` | 모델 배포 이름 |
 
-### 4.3 OTel Operator가 주입하는 환경변수
+### 4.3 OTel 환경변수
+
+#### myapp: OTel Operator가 주입하는 환경변수
 
 Instrumentation CR + Webhook이 자동 주입:
 
@@ -177,6 +228,17 @@ Instrumentation CR + Webhook이 자동 주입:
 | `OTEL_LOGS_EXPORTER` | `none` | 로그 비활성화 |
 | `OTEL_SERVICE_NAME` | `agui-server` | 서비스 이름 |
 | `OTEL_RESOURCE_ATTRIBUTES` | `service.namespace=myapp,...` | 리소스 속성 |
+
+#### otel-app: Deployment에서 직접 설정하는 환경변수
+
+| 환경변수 | 값 | 용도 |
+|---|---|---|
+| `AZURE_OPENAI_ENDPOINT` | SC Secret `AZURE_AISERVICES_OPENAI_BASE` | Azure OpenAI 엔드포인트 |
+| `AZURE_OPENAI_DEPLOYMENT_NAME` | `gpt-5.2-chat` | 모델 배포명 |
+| `AZURE_OPENAI_API_VERSION` | `2024-12-01-preview` | API 버전 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector-collector.otel-app.svc.cluster.local:4317` | OTLP gRPC Collector |
+
+> otel-app은 OTel Operator auto-inject를 사용하지 않음. 앱 내부에서 OTel SDK로 직접 계측. 환경변수 상세는 [upstream README](https://github.com/hellices/otel-langfuse) 참조.
 
 ### 4.4 Workload Identity Webhook이 주입하는 환경변수
 
@@ -193,6 +255,8 @@ Instrumentation CR + Webhook이 자동 주입:
 
 ### 5.1 K8s 리소스 맵
 
+#### myapp
+
 ```
 Namespace: myapp
 ├── Deployment/agui-server          ← 직접 관리
@@ -204,6 +268,22 @@ Namespace: myapp
 ├── ServiceAccount/sc-account-0429ea37-...  ← Service Connector 자동 생성
 ├── Secret/sc-myappaifconnection-secret     ← Service Connector 자동 생성
 └── FederatedIdentityCredential             ← Service Connector가 UAMI에 등록
+```
+
+#### otel-app
+
+```
+Namespace: otel-app
+├── Deployment/question-app                 ← 직접 관리
+│   └── Pod
+│       └── container: question-app        (앱 내장 OTel SDK, auto-inject 없음)
+├── Service/question-app (ClusterIP)         ← 직접 관리
+├── OpenTelemetryCollector/otel-collector     ← infra/otel-collector.yaml
+├── PodMonitor/otel-collector-metrics         ← infra/otel-collector.yaml
+├── Secret/azure-monitor-secret              ← infra/azure-monitor-secret.yaml (gitignore)
+├── ServiceAccount/sc-account-0429ea37-...   ← Service Connector 자동 생성
+├── Secret/sc-aifconotel-secret              ← Service Connector 자동 생성
+└── FederatedIdentityCredential              ← Service Connector가 UAMI에 등록
 ```
 
 ### 5.2 리소스 제한
@@ -240,12 +320,25 @@ tolerations:
 
 ### 6.1 컨테이너 이미지
 
+#### myapp
+
 | 항목 | 값 |
 |---|---|
 | Base Image | `python:3.12-slim` |
 | Registry | `acrcontosokrc01.azurecr.io` (Private Endpoint) |
 | 이미지 경로 | `acrcontosokrc01.azurecr.io/myapp/agui-server:latest` |
 | Pull 정책 | `Always` |
+
+#### otel-app (question-app)
+
+| 항목 | 값 |
+|---|---|
+| 소스 레포 | [`hellices/otel-langfuse`](https://github.com/hellices/otel-langfuse) |
+| 이미지 | `ghcr.io/hellices/otel-langfuse:sha-a190823` |
+| Registry | GitHub Container Registry (GHCR) |
+| 내장 OTel | `TracerProvider` + `OTLPSpanExporter`, `LangchainInstrumentor` |
+| 프레임워크 | LangGraph (FastAPI) |
+| Pull 정책 | `IfNotPresent` |
 
 ### 6.2 빌드 순서
 
@@ -283,6 +376,8 @@ kubectl rollout restart deploy/agui-server -n myapp
 
 ### 7.1 수집 메트릭
 
+#### myapp 메트릭
+
 | 메트릭 | 타입 | 소스 | 의미 |
 |---|---|---|---|
 | `gen_ai_client_operation_duration_seconds` | Histogram | openai-v2 instrumentor | LLM API 호출 지연 시간 |
@@ -290,19 +385,39 @@ kubectl rollout restart deploy/agui-server -n myapp
 | `http_server_active_requests` | Gauge | FastAPI instrumentor | 현재 처리 중인 HTTP 요청 수 |
 | `http_server_duration_milliseconds` | Histogram | FastAPI instrumentor | HTTP 요청 처리 시간 |
 
+#### question-app 메트릭
+
+앱 내장 OTel SDK가 생성한 traces/metrics가 Collector를 거쳐 App Insights + Prometheus로 전달됨. 상세는 [upstream README](https://github.com/hellices/otel-langfuse) 참조.
+
 ### 7.2 메트릭 경로
+
+#### myapp → Prometheus / Grafana
 
 ```
 앱 코드 / OpenAI SDK / FastAPI
     │ OTel SDK (auto-instrumentation)
     ▼
-OTLP HTTP → OTel Collector (:4318)
+OTLP HTTP → OTel Collector (:4318, opentelemetry-operator-system)
     │ Prometheus Exporter (:8889)
     ▼
 ama-metrics (PodMonitor 스크래핑)
     │ AMPLS (Private Link)
     ▼
 Azure Managed Prometheus → Grafana
+```
+
+#### otel-app → Application Insights + Grafana
+
+```
+앱 코드 (OTel SDK 내장)
+    │ OTLP gRPC
+    ▼
+OTel Collector (:4317, otel-app)
+    ├─ azuremonitor exporter → Application Insights (traces + metrics)
+    └─ Prometheus Exporter (:8889)
+        │ PodMonitor 스크래핑
+        ▼
+      ama-metrics → Managed Prometheus → Grafana
 ```
 
 ### 7.3 주요 대시보드 쿼리
@@ -321,6 +436,8 @@ histogram_quantile(0.99, rate(http_server_duration_milliseconds_bucket{service_n
 # 동시 접속 수
 http_server_active_requests{service_name="agui-server"}
 ```
+
+> question-app Grafana 대시보드는 [upstream 레포](https://github.com/hellices/otel-langfuse/tree/main/k8s)에 JSON 제공 — Azure Managed Grafana에 import하여 사용.
 
 ---
 
@@ -376,6 +493,8 @@ kubectl exec -n myapp deploy/agui-server -- \
 
 ## 9. 파일 구조
 
+### myapp
+
 ```
 myapp/
 ├── server.py               # FastAPI 앱 (AG-UI 엔드포인트, OTel 계측)
@@ -386,3 +505,13 @@ myapp/
 ├── k8s-deploy.yaml          # Deployment + Service
 └── otel-instrumentation.yaml  # OTel Instrumentation CR
 ```
+
+### otel-app
+
+```
+otel-app/
+└── deployment.yaml          # question-app Deployment + Service
+```
+
+> 앱 소스코드는 upstream 레포 [`hellices/otel-langfuse`](https://github.com/hellices/otel-langfuse)에서 관리.
+> GHCR 이미지(`ghcr.io/hellices/otel-langfuse`)를 직접 pull하여 배포하며, 이 워크스페이스에는 K8s 매니페스트만 포함.

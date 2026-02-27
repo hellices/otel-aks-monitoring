@@ -1,0 +1,2 @@
+# Secrets (connection strings, keys)
+infra/azure-monitor-secret.yaml

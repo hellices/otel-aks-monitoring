@@ -1,10 +1,18 @@
+# 사전 조건: Secret 먼저 배포 (gitignore 대상)
+#   kubectl apply -f infra/azure-monitor-secret.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: otel-app
+---
 apiVersion: opentelemetry.io/v1beta1
 kind: OpenTelemetryCollector
 metadata:
   name: otel-collector
-  namespace: opentelemetry-operator-system
+  namespace: otel-app
 spec:
-  image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.146.0
+  image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.146.1
   mode: deployment
   replicas: 1
   tolerations:
@@ -12,6 +20,12 @@ spec:
       operator: "Equal"
       value: "general"
       effect: "NoSchedule"
+  env:
+    - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+      valueFrom:
+        secretKeyRef:
+          name: azure-monitor-secret
+          key: connection-string
   config:
     receivers:
       otlp:
@@ -25,36 +39,18 @@ spec:
         send_batch_size: 1024
         timeout: 5s
     exporters:
-      prometheus:
-        endpoint: 0.0.0.0:8889
-        resource_to_telemetry_conversion:
-          enabled: true
+      azuremonitor:
+        connection_string: ${env:APPLICATIONINSIGHTS_CONNECTION_STRING}
+      debug:
+        verbosity: detailed
     service:
       pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [azuremonitor, debug]
         metrics:
           receivers: [otlp]
           processors: [batch]
-          exporters: [prometheus]
----
-apiVersion: azmonitoring.coreos.com/v1
-kind: PodMonitor
-metadata:
-  name: otel-collector-metrics
-  namespace: opentelemetry-operator-system
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/component: opentelemetry-collector
-      app.kubernetes.io/instance: opentelemetry-operator-system.otel-collector
-      app.kubernetes.io/managed-by: opentelemetry-operator
-  podMetricsEndpoints:
-    - port: prometheus
-      path: /metrics
-      interval: 30s
-    - port: metrics
-      path: /metrics
-      interval: 30s
-      metricRelabelings:
-        - targetLabel: source
-          replacement: otel-collector
-          action: replace
+          exporters: [azuremonitor, debug]
+

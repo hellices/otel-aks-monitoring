@@ -31,10 +31,12 @@ spec:
           effect: "NoSchedule"
       containers:
         - name: agui-server
-          image: acrcontosokrc01.azurecr.io/myapp/agui-server:latest
+          image: acrrubiconkrc01.azurecr.io/myapp/agui-server:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
+            - containerPort: 9464
+              name: metrics
           envFrom:
             - secretRef:
                 name: sc-myappaifconnection-secret
@@ -66,10 +68,26 @@ kind: Service
 metadata:
   name: agui-server
   namespace: myapp
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
 spec:
   selector:
     app: agui-server
   ports:
     - port: 80
       targetPort: 8080
-  type: ClusterIP
+  type: LoadBalancer
+---
+apiVersion: azmonitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: agui-server-metrics
+  namespace: myapp
+spec:
+  selector:
+    matchLabels:
+      app: agui-server
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

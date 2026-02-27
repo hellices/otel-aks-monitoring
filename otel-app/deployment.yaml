@@ -1,0 +1,87 @@
+# Deployment + Service for question-app on AKS
+# Service Connector가 자동 생성하는 리소스:
+#   - ServiceAccount (Workload Identity 바인딩)
+#   - Secret (AI Foundry connection 정보)
+# 아래 값들은 Service Connector 설정 후 실제 값으로 교체 필요:
+#   - serviceAccountName
+#   - AZURE_OPENAI_ENDPOINT (Secret에서 주입 또는 직접 지정)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: question-app
+  namespace: otel-app
+  labels:
+    app: question-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: question-app
+  template:
+    metadata:
+      labels:
+        app: question-app
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: sc-account-0429ea37-bae6-45c3-beeb-e5efdcaa67ba
+      tolerations:
+        - key: "workload"
+          operator: "Equal"
+          value: "general"
+          effect: "NoSchedule"
+      containers:
+        - name: question-app
+          image: ghcr.io/hellices/otel-langfuse:sha-a9b1979
+          ports:
+            - containerPort: 8000
+          env:
+            # Azure OpenAI - Service Connector Secret에서 주입
+            - name: AZURE_OPENAI_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: sc-aifconotel-secret
+                  key: AZURE_AISERVICES_OPENAI_BASE
+            # API Key 미설정 → DefaultAzureCredential 사용
+            - name: AZURE_OPENAI_DEPLOYMENT_NAME
+              value: "gpt-5.2-chat"
+            - name: AZURE_OPENAI_API_VERSION
+              value: "2024-12-01-preview"
+            # OpenTelemetry - 클러스터 내부 Collector
+            # 앱이 gRPC exporter 사용 → 4317 포트 (HTTP는 4318)
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector-collector.otel-app.svc.cluster.local:4317"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: question-app
+  namespace: otel-app
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  selector:
+    app: question-app
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: LoadBalancer

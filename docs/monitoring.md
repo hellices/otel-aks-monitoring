@@ -1,56 +1,56 @@
 # 모니터링 구축 가이드
 
-> AKS 폐쇄망 환경에서 OTel Operator 기반 자동 계측 + Azure Managed Prometheus + Grafana 메트릭 파이프라인 구축.
+> AKS 폐쇄망 환경에서 OTel Operator 기반 두 가지 모니터링 방식을 병행 운영.
+> 이 문서는 공통 인프라(OTel Operator, AMPLS)와 전체 개요를 다루며, 각 방식의 상세 구성은 별도 문서에서 설명.
 
----
-
-## 1. 아키텍처
-
-### 1.1 메트릭 파이프라인 (전체 흐름)
-
-```
-App Pod (agui-server)
-  │
-  │  ① OTel auto-instrumentation (init container 주입)
-  │     + OpenAI instrumentor (gen_ai.* 메트릭)
-  │     + FastAPI instrumentor (http_server.* 메트릭)
-  │     + 커스텀 메트릭 (agui.* 메트릭)
-  │
-  │  ② OTLP HTTP (:4318)
-  ▼
-OTel Collector (opentelemetry-operator-system)
-  │  receivers: otlp
-  │  processors: batch (1024/5s)
-  │  exporters: prometheus (:8889)
-  │
-  │  ③ PodMonitor 스크래핑 (30s 간격)
-  ▼
-ama-metrics (kube-system, Managed Prometheus addon)
-  │
-  │  ④ Private Link (AMPLS + PE)
-  ▼
-Azure Monitor Workspace → Managed Grafana
-```
-
-### 1.2 설계 선택: ama-metrics 스크래핑 방식
-
-두 가지 옵션을 검토한 후 **Option B**를 선택:
-
-| | Option A: Direct Remote Write | Option B: ama-metrics 스크래핑 ✅ |
+| 방식 | 대상 앱 | 상세 문서 |
 |---|---|---|
-| 방식 | Collector → prometheusremotewrite → DCE | Collector → prometheus exporter → ama-metrics |
-| 장점 | Collector가 직접 전송 | ama-metrics 내장, DCR/DCE 인증 자동 |
-| 단점 | DCE 인증 수동 구성 필요 | 스크래핑 간격만큼 지연 |
-
-**선택 이유**: ama-metrics가 AKS에 이미 내장 (Managed Prometheus addon), DCR/DCE 인증 자동 구성, PodMonitor만 추가하면 연동 완료.
+| **Prometheus / Grafana** | myapp (agui-server) | **[monitoring-prometheus.md](monitoring-prometheus.md)** |
+| **Application Insights** | otel-app (question-app) | **[monitoring-appinsights.md](monitoring-appinsights.md)** |
 
 ---
 
-## 2. OTel Operator 설치
+## 1. 아키텍처 개요
+
+```
+┌─ Prometheus / Grafana 방식 ──────────────────────────────────────────────────┐
+│                                                                              │
+│  agui-server (myapp)                                                         │
+│    │ OTel auto-instrumentation                                               │
+│    │ Prometheus exporter (:9464 /metrics)                                     │
+│    │                                                                          │
+│    └─ PodMonitor ─▶ ama-metrics ─▶ Managed Prometheus ─▶ Grafana             │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+┌─ Application Insights 방식 ──────────────────────────────────────────────────┐
+│                                                                              │
+│  question-app (otel-app)                                                     │
+│    │ 앱 내장 OTel SDK ─▶ OTLP gRPC (:4317)                                   │
+│    ▼                                                                         │
+│  OTel Collector (otel-app)                                                   │
+│    └─ azuremonitor exporter ─▶ Application Insights (traces + metrics)       │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 방식 비교
+
+| | Prometheus / Grafana | Application Insights |
+|---|---|---|
+| **Collector** | 불필요 (앱이 직접 /metrics 노출) | `otel-app` 네임스페이스 |
+| **트레이스** | 미수집 | azuremonitor → App Insights |
+| **메트릭** | Prometheus (:9464) → PodMonitor → Grafana | azuremonitor → App Insights |
+| **앱 계측** | OTel Operator auto-inject | 앱 내장 OTel SDK |
+| **OTLP** | 없음 (앱이 직접 Prometheus 노출) | gRPC (:4317) |
+| **인증** | DCR/DCE 자동 | Connection String (Secret) |
+| **확인 도구** | Grafana | App Insights |
+
+---
+
+## 2. 공통 인프라: OTel Operator
 
 매니페스트: [`infra/opentelemetry-operator.yaml`](../infra/opentelemetry-operator.yaml)
 
-CRD, RBAC, Webhook, cert-manager Certificate/Issuer, Deployment 포함.
+두 방식 모두 OTel Operator가 필요. CRD, RBAC, Webhook, cert-manager Certificate/Issuer, Deployment 포함.
 
 ```bash
 kubectl apply -f infra/opentelemetry-operator.yaml
@@ -68,189 +68,13 @@ kubectl get po -n opentelemetry-operator-system
 
 ---
 
-## 3. OTel Collector + PodMonitor 배포
+## 3. 공통 인프라: AMPLS (Azure Monitor Private Link Scope)
 
-매니페스트: [`infra/otel-collector.yaml`](../infra/otel-collector.yaml)
+> 폐쇄망에서 Azure Monitor 통신 시, Firewall TLS Inspection이 인증서를 변조하여 SSL 에러 발생.
+> AMPLS + Private Endpoint로 VNet 내부에서 직접 통신해야 함.
+> 두 방식 모두 AMPLS를 경유 (ama-metrics는 DCE, azuremonitor exporter는 Ingestion Endpoint).
 
-```bash
-kubectl apply -f infra/otel-collector.yaml
-```
-
-### 3.1 Collector 구성
-
-```yaml
-receivers:
-  otlp:
-    protocols:
-      grpc: { endpoint: 0.0.0.0:4317 }
-      http: { endpoint: 0.0.0.0:4318 }
-processors:
-  batch: { send_batch_size: 1024, timeout: 5s }
-exporters:
-  prometheus:
-    endpoint: 0.0.0.0:8889
-    resource_to_telemetry_conversion: { enabled: true }
-service:
-  pipelines:
-    metrics:
-      receivers: [otlp]
-      processors: [batch]
-      exporters: [prometheus]
-```
-
-| 항목 | 값 |
-|---|---|
-| 이미지 | `otel-collector-contrib:0.146.0` |
-| Mode | deployment (replicas: 1) |
-| OTLP gRPC | `:4317` |
-| OTLP HTTP | `:4318` |
-| Prometheus | `:8889` (메트릭 노출) |
-
-### 3.2 PodMonitor
-
-> ⚠️ API Group이 `azmonitoring.coreos.com` (Azure 전용). 표준 `monitoring.coreos.com`이 아님.
-
-```yaml
-apiVersion: azmonitoring.coreos.com/v1
-kind: PodMonitor
-metadata:
-  name: otel-collector-metrics
-  namespace: opentelemetry-operator-system
-spec:
-  podMetricsEndpoints:
-    - port: prometheus    # 앱 메트릭 (OTLP → Prometheus 변환)
-      path: /metrics
-      interval: 30s
-    - port: metrics       # Collector 자체 메트릭 (8888)
-      path: /metrics
-      interval: 30s
-```
-
-### 3.3 Collector Service 확인
-
-```bash
-kubectl get svc -n opentelemetry-operator-system -l app.kubernetes.io/managed-by=opentelemetry-operator
-# otel-collector-collector             ClusterIP  10.66.236.213  4317,4318,8889
-# otel-collector-collector-monitoring  ClusterIP  ...            8888
-```
-
----
-
-## 4. 앱 자동 계측 (Python)
-
-### 4.1 Instrumentation CR
-
-매니페스트: [`myapp/otel-instrumentation.yaml`](../myapp/otel-instrumentation.yaml)
-
-```yaml
-apiVersion: opentelemetry.io/v1alpha1
-kind: Instrumentation
-metadata:
-  name: python-instrumentation
-  namespace: myapp
-spec:
-  exporter:
-    endpoint: http://otel-collector-collector.opentelemetry-operator-system.svc.cluster.local:4318
-  propagators: [tracecontext, baggage]
-  python:
-    env:
-      - name: OTEL_METRICS_EXPORTER
-        value: otlp          # 메트릭만 수집
-      - name: OTEL_TRACES_EXPORTER
-        value: none           # 트레이스 비활성화
-      - name: OTEL_LOGS_EXPORTER
-        value: none           # 로그 비활성화
-  resource:
-    resourceAttributes:
-      service.name: agui-server
-      service.namespace: myapp
-      deployment.environment: production
-```
-
-```bash
-kubectl apply -f myapp/otel-instrumentation.yaml
-```
-
-### 4.2 Deployment 어노테이션
-
-`k8s-deploy.yaml`의 Pod template에 추가:
-
-```yaml
-annotations:
-  instrumentation.opentelemetry.io/inject-python: "true"
-```
-
-이 어노테이션으로 OTel Operator가 자동으로:
-- init container (`opentelemetry-auto-instrumentation-python`) 주입
-- `OTEL_*` 환경변수 설정 (exporter, service name, resource attributes 등)
-- `PYTHONPATH`에 auto-instrumentation 라이브러리 추가
-
-### 4.3 앱 내 OpenAI Instrumentor + 커스텀 메트릭
-
-`gen_ai.*` 메트릭은 auto-instrumentation만으로는 수집 안 됨. 앱 이미지에 instrumentor를 설치하고 명시적으로 호출해야 함:
-
-```python
-# server.py
-from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
-from opentelemetry import metrics
-
-OpenAIInstrumentor().instrument()  # gen_ai.* 메트릭 활성화
-
-# 커스텀 메트릭
-meter = metrics.get_meter("agui.server", "1.0.0")
-agent_request_counter = meter.create_counter(
-    "agui.agent.request.count",
-    description="Total number of AG-UI agent requests",
-    unit="1",
-)
-```
-
-**requirements.txt 주의사항:**
-```
-opentelemetry-api
-opentelemetry-semantic-conventions-ai==0.4.13   # ⚠️ 0.4.14는 LLM_SYSTEM 제거됨
-opentelemetry-instrumentation-openai-v2
-```
-
-> `opentelemetry-semantic-conventions-ai`는 반드시 `==0.4.13` 고정. 0.4.14에서 `SpanAttributes.LLM_SYSTEM`이 제거되어 `agent-framework`가 `AttributeError`로 크래시함.
-
-### 4.4 수집되는 메트릭
-
-| 메트릭 | 타입 | scope | 설명 |
-|---|---|---|---|
-| `gen_ai_client_operation_duration_seconds` | histogram | `opentelemetry.instrumentation.openai_v2` | Gen AI 호출 latency |
-| `agui_agent_request_count_total` | counter | `agui.server` (커스텀) | 에이전트 요청 수 |
-| `http_server_active_requests` | gauge | `opentelemetry.instrumentation.fastapi` | 활성 HTTP 요청 수 |
-| `http_server_duration_milliseconds` | histogram | `opentelemetry.instrumentation.fastapi` | HTTP 요청 처리 시간 |
-| `http_server_response_size_bytes` | histogram | `opentelemetry.instrumentation.fastapi` | HTTP 응답 크기 |
-
-주요 레이블: `gen_ai_request_model="gpt-5.2-chat"`, `gen_ai_system="openai"`, `server_address="aif-contoso-krc-01.openai.azure.com"`, `service_name="agui-server"`
-
-### 4.5 Grafana PromQL 예시
-
-```promql
-# Gen AI 평균 응답 시간
-rate(gen_ai_client_operation_duration_seconds_sum[5m])
-  / rate(gen_ai_client_operation_duration_seconds_count[5m])
-
-# AG-UI 에이전트 요청 RPS
-rate(agui_agent_request_count_total[5m])
-
-# HTTP 요청 처리 시간
-rate(http_server_duration_milliseconds_sum[5m])
-  / rate(http_server_duration_milliseconds_count[5m])
-
-# 활성 요청 수
-http_server_active_requests{service_name="agui-server"}
-```
-
----
-
-## 5. AMPLS (Azure Monitor Private Link Scope)
-
-> 폐쇄망에서 ama-metrics → Azure Monitor 통신 시, Firewall TLS Inspection이 인증서를 변조하여 SSL 에러 발생. AMPLS + Private Endpoint로 VNet 내부에서 직접 통신해야 함.
-
-### 5.1 AMPLS 구성
+### 3.1 AMPLS 구성
 
 | 항목 | 값 |
 |---|---|
@@ -264,11 +88,11 @@ http_server_active_requests{service_name="agui-server"}
 | `MSProm-koreacentral-aks-contoso-koreacentral` | `rg-contoso-koreacentral-01` |
 | `azuremonitor-workspace-contoso-krc-01` | `MA_..._managed` |
 
-### 5.2 DCR-DCE 연결
+### 3.2 DCR-DCE 연결
 
 Portal → Monitor → 데이터 수집 규칙 → 각 DCR 선택 → 데이터 수집 엔드포인트 → DCE 선택.
 
-### 5.3 configurationAccessEndpoint DCRA (핵심!)
+### 3.3 configurationAccessEndpoint DCRA (핵심!)
 
 > **이것이 가장 중요한 단계.**
 > DCR에 DCE를 연결하는 것만으로는 부족. AKS 리소스에 `configurationAccessEndpoint` DCRA를 추가해야 에이전트가 Private Link를 통해 구성을 가져올 수 있음.
@@ -299,71 +123,36 @@ az rest --method put \
 
 ---
 
-## 6. 트러블슈팅
+## 4. 공통 트러블슈팅
 
-### 6.1 SSL Handshake 에러
+> 각 방식별 트러블슈팅은 상세 문서 참조.
+
+### 4.1 SSL Handshake 에러
 
 ```
 ❌ 증상: ama-metrics 로그에 "Error in SSL handshake" 반복
 ```
 
-**원인:** Firewall TLS Inspection이 Azure Monitor 인증서를 변조 → SSL 실패  
+**원인:** Firewall TLS Inspection이 Azure Monitor 인증서를 변조 → SSL 실패
 **해결:** AMPLS + Private Endpoint 생성 → DNS가 Private IP로 해석 → Firewall 우회
 
-### 6.2 403 "Data collection endpoint must be used"
+### 4.2 403 "Data collection endpoint must be used"
 
 ```
 ❌ 증상: SSL 해결 후 403 에러
    "Data collection endpoint must be used to access configuration over private link."
 ```
 
-**원인:** DNS가 Private IP를 반환하면 Azure Monitor가 Private Link 접근으로 인식 → DCE 통한 접근 강제 → `configurationAccessEndpoint` DCRA 없음  
-**해결:** AKS에 `configurationAccessEndpoint` DCRA 생성 (위 5.3 참고)
-
-### 6.3 PodMonitor 스크래핑 안 됨
-
-```
-❌ 증상: PodMonitor가 Collector를 스크래핑하지 못함
-```
-
-**원인:** `port: prometheus-dev` ≠ 실제 포트 이름 `prometheus`  
-**해결:** `port: prometheus`로 수정
-
-### 6.4 opentelemetry-semantic-conventions-ai 0.4.14 크래시
-
-```
-❌ 증상: Pod CrashLoopBackOff
-   AttributeError: type object 'SpanAttributes' has no attribute 'LLM_SYSTEM'
-```
-
-**원인:** `opentelemetry-instrumentation-openai-v2`가 의존성으로 `0.4.14`를 설치, `agent-framework`가 `SpanAttributes.LLM_SYSTEM` 사용 → 0.4.14에서 제거됨  
-**해결:** `requirements.txt`에 `opentelemetry-semantic-conventions-ai==0.4.13` 고정
+**원인:** DNS가 Private IP를 반환하면 Azure Monitor가 Private Link 접근으로 인식 → DCE 통한 접근 강제 → `configurationAccessEndpoint` DCRA 없음
+**해결:** AKS에 `configurationAccessEndpoint` DCRA 생성 (위 3.3 참고)
 
 ---
 
-## 7. 진단 명령어
+## 5. 공통 진단 명령어
 
 ```bash
 # OTel Operator 상태
 kubectl get po -n opentelemetry-operator-system
-
-# OTel Collector 서비스
-kubectl get svc -n opentelemetry-operator-system -l app.kubernetes.io/managed-by=opentelemetry-operator
-
-# Instrumentation CR 확인
-kubectl get instrumentation -n myapp
-
-# 앱 Pod에 주입된 init container 확인
-kubectl get pod -n myapp -l app=agui-server -o jsonpath='{.items[0].spec.initContainers[*].name}'
-
-# 앱 Pod의 OTEL 환경변수 확인
-kubectl get pod -n myapp -l app=agui-server -o jsonpath='{range .items[0].spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' | grep OTEL
-
-# Collector Prometheus 메트릭 직접 확인 (gen_ai, agui, http_server)
-kubectl run curl-test --rm -it --restart=Never --image=curlimages/curl \
-  -n opentelemetry-operator-system \
-  --overrides='{"spec":{"tolerations":[{"key":"workload","operator":"Equal","value":"general","effect":"NoSchedule"}]}}' \
-  -- sh -c 'curl -s http://otel-collector-collector:8889/metrics | grep -E "^(gen_ai|agui|http_server)" | head -20'
 
 # ama-metrics 에러 로그
 kubectl exec -n kube-system deploy/ama-metrics -- cat /opt/microsoft/linuxmonagent/mdsd.err
@@ -385,17 +174,14 @@ kubectl rollout restart ds/ama-metrics-node -n kube-system
 
 ---
 
-## 8. 정상 동작 체크리스트
+## 6. 공통 체크리스트
 
 | # | 항목 | 확인 방법 | 기대 결과 |
 |---|------|----------|----------|
 | 1 | OTel Operator 실행 | `kubectl get po -n opentelemetry-operator-system` | Running |
-| 2 | OTel Collector 실행 | `kubectl get po -n opentelemetry-operator-system -l app.kubernetes.io/component=opentelemetry-collector` | Running |
-| 3 | Instrumentation CR 존재 | `kubectl get instrumentation -n myapp` | python-instrumentation |
-| 4 | init container 주입됨 | Pod spec 확인 | `opentelemetry-auto-instrumentation-python` |
-| 5 | ama-metrics 실행 | `kubectl get po -n kube-system -l rsName=ama-metrics` | Running |
-| 6 | mdsd.err 에러 없음 | `kubectl exec ... cat mdsd.err` | 에러 없음 |
-| 7 | DNS Private IP 해석 | `nslookup ...metrics.ingest.monitor.azure.com` | 10.2.0.x |
-| 8 | DCRA 3개 존재 | REST API 조회 | configurationAccessEndpoint 포함 |
-| 9 | gen_ai 메트릭 수집 | Collector :8889 메트릭 확인 | `gen_ai_client_operation_duration_seconds` |
-| 10 | Grafana에서 조회 | PromQL 실행 | 데이터 표시 |
+| 2 | ama-metrics 실행 | `kubectl get po -n kube-system -l rsName=ama-metrics` | Running |
+| 3 | mdsd.err 에러 없음 | `kubectl exec ... cat mdsd.err` | 에러 없음 |
+| 4 | DNS Private IP 해석 | `nslookup ...metrics.ingest.monitor.azure.com` | 10.2.0.x |
+| 5 | DCRA 3개 존재 | REST API 조회 | configurationAccessEndpoint 포함 |
+
+> 방식별 체크리스트: [Prometheus](monitoring-prometheus.md#7-정상-동작-체크리스트) | [Application Insights](monitoring-appinsights.md#7-정상-동작-체크리스트)
