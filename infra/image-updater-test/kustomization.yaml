@@ -1,0 +1,7 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+images:
+  - name: acrrubiconkrc01.azurecr.io/test-app
+    newTag: "1.0.0"
